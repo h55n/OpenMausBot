@@ -1,4 +1,4 @@
-name: Rebase universal provider accounts
+name: Rebase universal provider accounts cleanly
 
 on:
   push:
@@ -15,10 +15,10 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Reapply feature commit on latest upstream
+      - name: Reapply feature commit directly on latest upstream
         run: |
           git config user.name "h55n"
           git config user.email "144530465+h55n@users.noreply.github.com"
-          git fetch origin feat/universal-provider-accounts
+          git checkout --detach 0558f689815966ede428e5d864eec824d231d434
           git cherry-pick cace1292b16640b60e52dc04a0b569387b57e42b
           git push origin HEAD:feat/universal-provider-accounts --force
