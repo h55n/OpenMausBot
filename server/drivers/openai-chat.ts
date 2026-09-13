@@ -142,15 +142,6 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
       };
     }
 
-    if (!response.body) {
-      throw new Error(options.noBodyError ?? `${options.httpErrorLabel} returned no response body`);
-    }
-    let text = "";
-    let reasoning = "";
-    let usage: Usage | null = null;
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
     try {
       readLoop: for (;;) {
         const { done, value } = await reader.read();
@@ -188,10 +179,73 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
           if (chunk.usage) usage = usageFrom(chunk.usage);
         }
       }
+
+      if (!stream) {
+        const json = await response.json() as CompletionJson;
+        const message = json.choices?.[0]?.message;
+        return {
+          text: typeof message?.content === "string" ? message.content : "",
+          reasoning: options.reasoning && typeof message?.reasoning_content === "string"
+            ? message.reasoning_content
+            : "",
+          usage: usageFrom(json.usage),
+        };
+      }
+
+      if (!response.body) {
+        throw new Error(options.noBodyError ?? `${options.httpErrorLabel} returned no response body`);
+      }
+      let text = "";
+      let reasoning = "";
+      let usage: Usage | null = null;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        readLoop: for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (buffer.trim() === "data: [DONE]") break;
+            throw new DOMException("Stream ended before completion", "AbortError");
+          }
+          resetIdleTimer();
+          buffer += decoder.decode(value, { stream: true });
+          let newline: number;
+          while ((newline = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newline).trim();
+            buffer = buffer.slice(newline + 1);
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") break readLoop;
+            let chunk: CompletionJson;
+            try {
+              chunk = JSON.parse(data) as CompletionJson;
+            } catch {
+              continue;
+            }
+            const delta = chunk.choices?.[0]?.delta;
+            const reasoningDelta = options.reasoning && typeof delta?.reasoning_content === "string"
+              ? delta.reasoning_content
+              : "";
+            const contentDelta = typeof delta?.content === "string" ? delta.content : "";
+            if (reasoningDelta) {
+              reasoning += reasoningDelta;
+              onDelta?.(reasoningDelta, "reasoning_text");
+            }
+            if (contentDelta) {
+              text += contentDelta;
+              onDelta?.(contentDelta, "assistant_text");
+            }
+            if (chunk.usage) usage = usageFrom(chunk.usage);
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+      }
+      return { text, reasoning, usage };
     } finally {
-      await reader.cancel().catch(() => {});
+      if (idleTimer) clearTimeout(idleTimer);
     }
-    return { text, reasoning, usage };
   };
 
   const messagesFor = (turn: SendTurnInput): OpenAIChatMessage[] => [
