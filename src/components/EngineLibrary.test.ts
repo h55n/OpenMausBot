@@ -64,11 +64,12 @@ describe("engine library", () => {
       const card = children.find((node) => isValidElement(node) && node.key === "claude");
       expect(card).toBeDefined();
       expect(isValidElement(card)).toBe(true);
-      if (!isValidElement(card)) throw new Error("expected Claude engine card wrapper");
+      if (!isValidElement<{ children: unknown }>(card)) throw new Error("expected Claude engine card wrapper");
       expect(card.type).toBe("div");
-      expect(isValidElement(card.props.children)).toBe(true);
-      if (!isValidElement(card.props.children)) throw new Error("expected Claude engine card");
-      expect(card.props.children.type).toBe(EngineCard);
+      const engineCard = card.props.children;
+      expect(isValidElement(engineCard)).toBe(true);
+      if (!isValidElement(engineCard)) throw new Error("expected Claude engine card");
+      expect(engineCard.type).toBe(EngineCard);
       const html = renderToStaticMarkup(tree);
       expect(html.match(/data-engine-card=/g)).toHaveLength(2);
     }
