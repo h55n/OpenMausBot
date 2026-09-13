@@ -1,4 +1,4 @@
-import { createElement } from "react";
+import { createElement, isValidElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { InstanceInfo } from "@/state/store";
@@ -60,9 +60,14 @@ describe("engine library", () => {
       // This parent/key contract prevents native disclosure state and React
       // form drafts from being discarded when authentication changes.
       const grid = tree.props.children;
-      const card = grid.props.children.find((node: { key: string }) => node.key === "claude");
+      const children = (grid.props.children as unknown[]).flat(Infinity);
+      const card = children.find((node) => isValidElement(node) && node.key === "claude");
       expect(card).toBeDefined();
+      expect(isValidElement(card)).toBe(true);
+      if (!isValidElement(card)) throw new Error("expected Claude engine card wrapper");
       expect(card.type).toBe("div");
+      expect(isValidElement(card.props.children)).toBe(true);
+      if (!isValidElement(card.props.children)) throw new Error("expected Claude engine card");
       expect(card.props.children.type).toBe(EngineCard);
       const html = renderToStaticMarkup(tree);
       expect(html.match(/data-engine-card=/g)).toHaveLength(2);
