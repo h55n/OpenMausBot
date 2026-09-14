@@ -2,7 +2,8 @@ name: Provider PR audit fix
 
 on:
   push:
-    branches: [tmp/provider-pr-audit-fix]
+    branches:
+      - tmp/provider-pr-audit-fix
 
 permissions:
   contents: write
@@ -21,125 +22,22 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - name: Checkout audited PR head
-        run: git checkout --detach 40b5833265a36ae436cd4571d974df2e98d313ba
+      - name: Save audit script and checkout audited head
+        run: |
+          git show HEAD:.github/provider_pr_audit_fix.py > /tmp/provider_pr_audit_fix.py
+          git checkout --detach 40b5833265a36ae436cd4571d974df2e98d313ba
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Record baseline typecheck
-        shell: bash
         run: |
           set +e
           pnpm typecheck
           code=$?
+          set -e
           echo "baseline_typecheck_exit=$code" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-      - name: Add managed provider key regression test
-        shell: python
-        run: |
-          from pathlib import Path
-          path = Path("server/provider-key-flow.test.ts")
-          text = path.read_text()
-          marker = 'it("managed provider connections pass their saved key without treating the preset as an OpenRouter route pin"'
-          if marker in text:
-              raise SystemExit("regression test already present")
-          text += r'''
-
-it("managed provider connections pass their saved key without treating the preset as an OpenRouter route pin", async () => {
-  const receivedAuth: string[] = [];
-  const receivedBodies: Array<Record<string, unknown>> = [];
-  const provider = createServer((req, res) => {
-    if (req.url === "/v1/models") {
-      receivedAuth.push(req.headers.authorization ?? "");
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ data: [{ id: "fixture-model" }] }));
-      return;
-    }
-    if (req.url !== "/v1/chat/completions") { res.writeHead(404).end(); return; }
-    receivedAuth.push(req.headers.authorization ?? "");
-    let raw = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => { raw += chunk; });
-    req.on("end", () => {
-      receivedBodies.push(JSON.parse(raw) as Record<string, unknown>);
-      if (req.headers.authorization !== "Bearer managed-fixture-key") {
-        res.writeHead(401, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "Invalid fixture credential" } }));
-        return;
-      }
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "managed fixture reply" } }] })}\n\ndata: [DONE]\n\n`);
-    });
-  });
-  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
-  const address = provider.address();
-  if (!address || typeof address === "string") throw new Error("fixture provider has no port");
-  const fixture = await launchVerificationServer();
-  const api = fixtureApi(fixture.info.url);
-  const sse = await openSse(`${fixture.info.url}/api/events`);
-  try {
-    await api("PATCH", "/api/config", {
-      providerConnections: {
-        "api-openrouter-fixture": {
-          displayName: "OpenRouter fixture",
-          apiKey: "managed-fixture-key",
-          url: `http://127.0.0.1:${address.port}/v1`,
-          providerPreset: "openrouter",
-          model: "fixture-model",
-        },
-      },
-    });
-    const disk = JSON.parse(readFileSync(join(fixture.info.dataDir, "config.json"), "utf8"));
-    const stored = disk.instances["api-openrouter-fixture"];
-    expect(stored.config.managedProviderPreset).toBe("openrouter");
-    expect(stored.config.provider).toBeUndefined();
-    expect(stored.environment[stored.config.apiKeyEnv]).toBe("managed-fixture-key");
-
-    const { bot } = await api("POST", "/api/bots", {
-      name: "Managed provider fixture",
-      modelSelection: { instanceId: "api-openrouter-fixture", model: "fixture-model" },
-    });
-    await api("POST", `/api/bots/${bot.id}/messages`, { text: "Exercise the managed provider key." });
-    await sse.until((frame) => frame.kind === "message" && frame.threadId === bot.threadId
-      && frame.message?.role === "bot" && frame.message?.text === "managed fixture reply");
-
-    expect(receivedAuth).toContain("Bearer managed-fixture-key");
-    expect(receivedBodies).toHaveLength(1);
-    expect(receivedBodies[0]?.provider).toBeUndefined();
-    const publicState = JSON.stringify([await api("GET", "/api/instances"), await api("GET", "/api/config"), sse.frames]);
-    expect(publicState).not.toContain("managed-fixture-key");
-  } finally {
-    sse.close();
-    await fixture.close();
-    await new Promise<void>((resolve) => provider.close(() => resolve()));
-  }
-});
-
-it("rejects insecure remote URLs for managed provider connections", async () => {
-  const fixture = await launchVerificationServer();
-  try {
-    const response = await fetch(`${fixture.info.url}/api/config`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        providerConnections: {
-          "api-insecure-fixture": {
-            displayName: "Insecure fixture",
-            apiKey: "fixture-key",
-            url: "http://example.com/v1",
-            providerPreset: "custom-openai-compatible",
-          },
-        },
-      }),
-    });
-    expect(response.status).toBe(400);
-  } finally {
-    await fixture.close();
-  }
-});
-'''
-          path.write_text(text)
+      - name: Add regression tests first
+        run: python /tmp/provider_pr_audit_fix.py test
       - name: Verify regression test is red before implementation
-        shell: bash
         run: |
           set +e
           pnpm vitest run server/provider-key-flow.test.ts
@@ -150,141 +48,8 @@ it("rejects insecure remote URLs for managed provider connections", async () => 
             exit 1
           fi
           echo "regression_test_red_exit=$code" >> "$GITHUB_STEP_SUMMARY"
-      - name: Apply provider fixes and restore upstream behavior
-        shell: python
-        run: |
-          from pathlib import Path
-
-          def replace_once(text: str, old: str, new: str, label: str) -> str:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
-              return text.replace(old, new, 1)
-
-          # server/config.ts: preserve upstream shared-computer support, enforce the
-          # server-side URL policy, and keep provider preset identity separate from
-          # OpenRouter's provider-routing pin.
-          path = Path("server/config.ts")
-          text = path.read_text()
-          text = replace_once(
-              text,
-              'import { parseStoredMcpServer } from "./mcp-registry.ts";\n',
-              'import { parseStoredMcpServer } from "./mcp-registry.ts";\nimport { validateProviderBaseUrl } from "./providers/catalog.ts";\n',
-              "config import",
-          )
-          text = replace_once(
-              text,
-              '  /** Experimental built-in browser. Off until explicitly enabled; each bot\n   * also has its own switch. */\n  browser: z.boolean().optional(),\n});',
-              '  /** Experimental built-in browser. Off until explicitly enabled; each bot\n   * also has its own switch. */\n  browser: z.boolean().optional(),\n  /** Opt-in computer sharing (a desktop lending folders, a terminal or\n   * computer control to a workspace). Off until explicitly enabled; there is\n   * no Settings toggle — see sharedComputersEnabled. */\n  sharedComputers: z.boolean().optional(),\n});',
-              "restore feature schema sharedComputers",
-          )
-          text = replace_once(
-              text,
-              'const providerConnectionIdSchema = z.string().regex(/^api-[a-z0-9][a-z0-9._-]{0,76}$/);\nconst providerConnectionSchema = z.object({\n  displayName: z.string().trim().min(1).max(80).refine((value) => !/\\p{Cc}/u.test(value), "Name cannot contain control characters"),\n  apiKey: z.string().min(1).max(4096).refine((value) => !/\\p{Cc}/u.test(value), "API key cannot contain control characters"),\n  url: z.string().trim().max(2048).url().refine((value) => /^https?:\\/\\//i.test(value), "Base URL must use http or https"),\n  model: z.string().trim().max(200).refine((value) => !/[\\r\\n\\0]/.test(value), "Model cannot contain control characters").optional(),\n  provider: z.string().trim().max(200).refine((value) => !/[\\r\\n\\0]/.test(value), "Provider cannot contain control characters").optional(),\n}).strict();',
-              'const providerConnectionIdSchema = z.string().regex(/^api-[a-z0-9][a-z0-9._-]{0,76}$/);\nconst providerConnectionPresetSchema = z.enum(["openai", "openrouter", "groq", "mistral", "nvidia-nim", "custom-openai-compatible"]);\nconst providerConnectionUrlSchema = z.string().trim().max(2048).url().superRefine((value, ctx) => {\n  try {\n    validateProviderBaseUrl(value);\n  } catch (error) {\n    ctx.addIssue({ code: "custom", message: error instanceof Error ? error.message : "Invalid provider URL" });\n  }\n});\nconst providerConnectionSchema = z.object({\n  displayName: z.string().trim().min(1).max(80).refine((value) => !/\\p{Cc}/u.test(value), "Name cannot contain control characters"),\n  apiKey: z.string().min(1).max(4096).refine((value) => !/\\p{Cc}/u.test(value), "API key cannot contain control characters"),\n  url: providerConnectionUrlSchema,\n  model: z.string().trim().max(200).refine((value) => !/[\\r\\n\\0]/.test(value), "Model cannot contain control characters").optional(),\n  providerPreset: providerConnectionPresetSchema,\n}).strict();',
-              "provider schema",
-          )
-          text = replace_once(
-              text,
-              '  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean };',
-              '  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean };',
-              "restore AppConfig sharedComputers",
-          )
-          text = replace_once(
-              text,
-              'export function builtInBrowserEnabled(cfg: AppConfig): boolean {\n  return cfg.features?.browser === true;\n}\n\n',
-              'export function builtInBrowserEnabled(cfg: AppConfig): boolean {\n  return cfg.features?.browser === true;\n}\n\n/** Opt-in computer sharing: the routes, the agent tools, the advertised\n * capability and the desktop connector. Off unless an explicit `true` turns\n * it on, because the reviewed feature still has open security holes (a\n * read-only folder grant could be escalated to a shell).\n *\n * Deliberately NOT a Settings toggle: this is a maintainer-only escape hatch\n * for an unfinished feature, not a user preference. Someone who needs it\n * enables it by hand in `~/.openmausbot/config.json`\n * (`{"features": {"sharedComputers": true}}`) and restarts the server. */\nexport function sharedComputersEnabled(cfg: AppConfig): boolean {\n  return cfg.features?.sharedComputers === true;\n}\n\n',
-              "restore sharedComputersEnabled",
-          )
-          text = replace_once(
-              text,
-              '      model?: string;\n      provider?: string;\n',
-              '      model?: string;\n      providerPreset: string;\n',
-              "provider mutation type",
-          )
-          text = replace_once(
-              text,
-              '          config: {\n            url: connection.url,\n            apiKeyEnv,\n            ...(connection.model ? { model: connection.model } : {}),\n            ...(connection.provider ? { provider: connection.provider } : {}),\n          },',
-              '          config: {\n            url: validateProviderBaseUrl(connection.url),\n            apiKeyEnv,\n            managedProviderPreset: connection.providerPreset,\n            ...(connection.model ? { model: connection.model } : {}),\n          },',
-              "stored managed provider config",
-          )
-          text = replace_once(
-              text,
-              '        if ((existing as Record<string, unknown>).driver !== "openai-compat") {\n          throw Object.assign(new Error("only OpenAI-compatible provider connections can be removed here"), { status: 400 });\n        }\n        delete diskInstances[instanceId];',
-              '        const existingRecord = existing as Record<string, unknown>;\n        const existingConfig = existingRecord.config;\n        const managedPreset = existingConfig && typeof existingConfig === "object" && !Array.isArray(existingConfig)\n          ? (existingConfig as Record<string, unknown>).managedProviderPreset\n          : undefined;\n        if (existingRecord.driver !== "openai-compat" || typeof managedPreset !== "string") {\n          throw Object.assign(new Error("only managed API provider connections can be removed here"), { status: 400 });\n        }\n        delete diskInstances[instanceId];',
-              "managed deletion guard",
-          )
-          path.write_text(text)
-
-          # The UI sends preset identity explicitly; it is metadata, not an
-          # OpenRouter routing directive.
-          path = Path("src/components/ProviderManager.tsx")
-          text = path.read_text()
-          text = replace_once(text, '              provider,\n', '              providerPreset: provider,\n', "ProviderManager payload")
-          path.write_text(text)
-
-          # Managed instances are recognized by durable metadata and never
-          # inherit/use the legacy OpenRouter routing pin.
-          path = Path("server/drivers/openai-compat.ts")
-          text = path.read_text()
-          text = replace_once(text, '  provider?: string;\n}', '  provider?: string;\n  managedProviderPreset?: string;\n}', "compat config marker")
-          text = replace_once(
-              text,
-              '    provider: typeof config.provider === "string"\n      ? config.provider || undefined\n      : process.env.OPENAI_COMPAT_PROVIDER || undefined,\n',
-              '    provider: typeof config.provider === "string"\n      ? config.provider || undefined\n      : process.env.OPENAI_COMPAT_PROVIDER || undefined,\n    managedProviderPreset: typeof config.managedProviderPreset === "string" && config.managedProviderPreset\n      ? config.managedProviderPreset\n      : undefined,\n',
-              "decode managed marker",
-          )
-          text = replace_once(
-              text,
-              '    const managedApiConnection = input.instanceId.startsWith("api-");',
-              '    const managedApiConnection = typeof config.managedProviderPreset === "string";',
-              "managed detection",
-          )
-          text = replace_once(
-              text,
-              '        ...(config.provider && isOpenRouterUrl(config.url)\n          ? { provider: { order: [config.provider], allow_fallbacks: false } }\n          : {}),',
-              '        ...(!managedApiConnection && config.provider && isOpenRouterUrl(config.url)\n          ? { provider: { order: [config.provider], allow_fallbacks: false } }\n          : {}),',
-              "routing guard",
-          )
-          path.write_text(text)
-
-          # Preset metadata follows the same conservative capability contract
-          # as the public capability helper.
-          path = Path("server/providers/catalog.ts")
-          text = path.read_text()
-          count = text.count("reasoning: true")
-          if count != 6:
-              raise SystemExit(f"catalog reasoning defaults: expected 6 true entries, found {count}")
-          text = text.replace("reasoning: true", "reasoning: false")
-          path.write_text(text)
-
-          # Restore upstream explanatory comments that were accidentally lost
-          # when the feature was synchronized as whole files.
-          path = Path("src/components/EngineLibrary.tsx")
-          text = path.read_text()
-          text = replace_once(
-              text,
-              '  const version = instance.snapshot.version?.match(/\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][\\w.-]+)?/)?.[0];',
-              '  // Some CLIs return their executable name rather than a version. Do not show\n  // duplicated labels such as “Grok · grok”; retain the raw value in details.\n  const version = instance.snapshot.version?.match(/\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][\\w.-]+)?/)?.[0];',
-              "EngineLibrary version comment",
-          )
-          text = replace_once(
-              text,
-              '}) {\n  return <div className="flex min-w-0 flex-col gap-5">',
-              '}) {\n  // Flat, instance-keyed siblings keep forms and sign-in state alive when a\n  // refreshed status moves a card between groups. Separate section parents\n  // would remount it and discard unsaved input.\n  return <div className="flex min-w-0 flex-col gap-5">',
-              "EngineSections comment",
-          )
-          path.write_text(text)
-
-          path = Path("server/drivers/openai-chat.ts")
-          text = path.read_text()
-          text = replace_once(
-              text,
-              '  ): Promise<Completion> => {\n    const timeoutController = new AbortController();',
-              '  ): Promise<Completion> => {\n    // Idle timer that is renewed on every received chunk during streaming.\n    const timeoutController = new AbortController();',
-              "idle timer comment",
-          )
-          path.write_text(text)
+      - name: Apply implementation fixes
+        run: python /tmp/provider_pr_audit_fix.py implement
       - name: Verify fixed provider flow
         run: |
           pnpm typecheck
