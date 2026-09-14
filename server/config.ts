@@ -228,10 +228,6 @@ const featureConfigSchema = z.object({
   /** Experimental built-in browser. Off until explicitly enabled; each bot
    * also has its own switch. */
   browser: z.boolean().optional(),
-  /** Opt-in computer sharing (a desktop lending folders, a terminal or
-   * computer control to a workspace). Off until explicitly enabled; there is
-   * no Settings toggle — see sharedComputersEnabled. */
-  sharedComputers: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -254,6 +250,28 @@ const instanceConfigSchema = z.object({
   config: z.json().optional(),
 });
 const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
+
+const providerConnectionIdSchema = z.string().regex(/^api-[a-z0-9][a-z0-9._-]{0,76}$/);
+const providerConnectionSchema = z.object({
+  displayName: z.string().trim().min(1).max(80).refine((value) => !/\p{Cc}/u.test(value), "Name cannot contain control characters"),
+  apiKey: z.string().min(1).max(4096).refine((value) => !/\p{Cc}/u.test(value), "API key cannot contain control characters"),
+  url: z.string().trim().max(2048).url().refine((value) => /^https?:\/\//i.test(value), "Base URL must use http or https"),
+  model: z.string().trim().max(200).refine((value) => !/[\r\n\0]/.test(value), "Model cannot contain control characters").optional(),
+  provider: z.string().trim().max(200).refine((value) => !/[\r\n\0]/.test(value), "Provider cannot contain control characters").optional(),
+}).strict();
+const providerConnectionsPatchSchema = z.record(z.string(), providerConnectionSchema).superRefine((value, ctx) => {
+  const entries = Object.entries(value);
+  if (entries.length > 50) ctx.addIssue({ code: "custom", message: "Too many provider connections" });
+  for (const [instanceId] of entries) {
+    const parsed = providerConnectionIdSchema.safeParse(instanceId);
+    if (!parsed.success) ctx.addIssue({ code: "custom", message: `Invalid provider connection id: ${instanceId}` });
+  }
+});
+const providerConnectionDeletesSchema = z.array(providerConnectionIdSchema).max(50);
+
+function providerConnectionApiKeyEnv(instanceId: string): string {
+  return `OPENMAUSBOT_API_${instanceId.slice(4).replace(/[^a-z0-9]+/gi, "_").toUpperCase()}_KEY`;
+}
 const defaultModelSelectionSchema = z.object({
   instanceId: z.string().trim().min(1),
   model: z.string().trim().min(1),
@@ -390,7 +408,7 @@ export interface AppConfig {
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
@@ -402,7 +420,10 @@ export type BrowserProfile = z.output<typeof browserProfileSchema> & {
    * immutable; omit from PATCH/config UI payloads. Absent means `id`. */
   partitionId?: string;
 };
-export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
+export type ConfigPatch = z.output<typeof appConfigPatchSchema> & {
+  providerConnections?: z.output<typeof providerConnectionsPatchSchema>;
+  providerConnectionDeletes?: z.output<typeof providerConnectionDeletesSchema>;
+};
 
 /** Resolve a canonical profile record to its exact durable Electron
  * partition identity. Callers must never substitute the display/API id. */
@@ -499,7 +520,24 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (!parsed.success) {
     throw Object.assign(new Error(schemaIssue(parsed.error, "Invalid configuration")), { status: 400 });
   }
-  return parsed.data;
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const providerConnections = raw.providerConnections === undefined
+    ? undefined
+    : providerConnectionsPatchSchema.safeParse(raw.providerConnections);
+  if (providerConnections && !providerConnections.success) {
+    throw Object.assign(new Error(schemaIssue(providerConnections.error, "Invalid provider connection")), { status: 400 });
+  }
+  const providerConnectionDeletes = raw.providerConnectionDeletes === undefined
+    ? undefined
+    : providerConnectionDeletesSchema.safeParse(raw.providerConnectionDeletes);
+  if (providerConnectionDeletes && !providerConnectionDeletes.success) {
+    throw Object.assign(new Error(schemaIssue(providerConnectionDeletes.error, "Invalid provider connection delete request")), { status: 400 });
+  }
+  return {
+    ...parsed.data,
+    ...(providerConnections ? { providerConnections: providerConnections.data } : {}),
+    ...(providerConnectionDeletes ? { providerConnectionDeletes: providerConnectionDeletes.data } : {}),
+  };
 }
 
 export function vpsSshAlias(cfg: AppConfig): string | null {
@@ -536,19 +574,6 @@ export function showToolCallsEnabled(cfg: AppConfig): boolean {
  * switch sits under it, so either can withhold the browser. */
 export function builtInBrowserEnabled(cfg: AppConfig): boolean {
   return cfg.features?.browser === true;
-}
-
-/** Opt-in computer sharing: the routes, the agent tools, the advertised
- * capability and the desktop connector. Off unless an explicit `true` turns
- * it on, because the reviewed feature still has open security holes (a
- * read-only folder grant could be escalated to a shell).
- *
- * Deliberately NOT a Settings toggle: this is a maintainer-only escape hatch
- * for an unfinished feature, not a user preference. Someone who needs it
- * enables it by hand in `~/.openmausbot/config.json`
- * (`{"features": {"sharedComputers": true}}`) and restarts the server. */
-export function sharedComputersEnabled(cfg: AppConfig): boolean {
-  return cfg.features?.sharedComputers === true;
 }
 
 /** Config sections no provider driver reads. A write that touches only
@@ -761,7 +786,20 @@ export const PROVIDER_CREDENTIAL_ENV = [
 
 /** Merge a partial config into ~/.openmausbot/config.json (secrets never
  * echoed back — callers report configured-or-not booleans only). */
-export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstances?: boolean } = {}): void {
+export function saveConfig(
+  patch: Partial<AppConfig>,
+  options: { replaceInstances?: boolean } = {},
+): void {
+  const providerMutation = patch as Partial<AppConfig> & {
+    providerConnections?: Record<string, {
+      displayName: string;
+      apiKey: string;
+      url: string;
+      model?: string;
+      provider?: string;
+    }>;
+    providerConnectionDeletes?: string[];
+  };
   const p = join(DATA_DIR, "config.json");
   let disk: JsonObject = {};
   try {
@@ -820,20 +858,53 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
     if (routingConflict) throw Object.assign(new Error(routingConflict), { status: 409 });
     disk.browserProfiles = nextProfiles;
   }
-  if (checkedPatch.instances) {
+  const providerConnections = providerMutation.providerConnections;
+  const providerConnectionDeletes = providerMutation.providerConnectionDeletes;
+  if (checkedPatch.instances || providerConnections !== undefined || providerConnectionDeletes !== undefined) {
     const currentInstances = jsonObjectSchema.safeParse(disk.instances);
     const storedInstances: JsonObject = currentInstances.success ? currentInstances.data : {};
-    const diskInstances: JsonObject = options.replaceInstances ? {} : storedInstances;
-    for (const [instanceId, entry] of Object.entries(checkedPatch.instances)) {
-      const current = jsonObjectSchema.safeParse(storedInstances[instanceId]);
-      const merged: JsonObject = current.success ? { ...current.data } : {};
-      // Replacement clears omitted known settings, but retained shadow
-      // entries keep fields understood only by a newer app or driver.
-      if (options.replaceInstances) {
-        for (const key of Object.keys(instanceConfigSchema.shape)) delete merged[key];
+    const diskInstances: JsonObject = options.replaceInstances ? {} : { ...storedInstances };
+    if (checkedPatch.instances) {
+      for (const [instanceId, entry] of Object.entries(checkedPatch.instances)) {
+        const current = jsonObjectSchema.safeParse(storedInstances[instanceId]);
+        const merged: JsonObject = current.success ? { ...current.data } : {};
+        // Replacement clears omitted known settings, but retained shadow
+        // entries keep fields understood only by a newer app or driver.
+        if (options.replaceInstances) {
+          for (const key of Object.keys(instanceConfigSchema.shape)) delete merged[key];
+        }
+        Object.assign(merged, entry);
+        diskInstances[instanceId] = merged;
       }
-      Object.assign(merged, entry);
-      diskInstances[instanceId] = merged;
+    }
+    if (providerConnections !== undefined) {
+      for (const [instanceId, connection] of Object.entries(providerConnections)) {
+        if (Object.hasOwn(storedInstances, instanceId)) {
+          throw Object.assign(new Error(`provider connection ${instanceId} already exists`), { status: 409 });
+        }
+        const apiKeyEnv = providerConnectionApiKeyEnv(instanceId);
+        diskInstances[instanceId] = {
+          driver: "openai-compat",
+          displayName: connection.displayName,
+          environment: { [apiKeyEnv]: connection.apiKey },
+          config: {
+            url: connection.url,
+            apiKeyEnv,
+            ...(connection.model ? { model: connection.model } : {}),
+            ...(connection.provider ? { provider: connection.provider } : {}),
+          },
+        };
+      }
+    }
+    if (providerConnectionDeletes !== undefined) {
+      for (const instanceId of providerConnectionDeletes) {
+        const existing = storedInstances[instanceId];
+        if (!existing) throw Object.assign(new Error(`unknown provider connection ${instanceId}`), { status: 404 });
+        if ((existing as Record<string, unknown>).driver !== "openai-compat") {
+          throw Object.assign(new Error("only OpenAI-compatible provider connections can be removed here"), { status: 400 });
+        }
+        delete diskInstances[instanceId];
+      }
     }
     disk.instances = diskInstances;
   }
